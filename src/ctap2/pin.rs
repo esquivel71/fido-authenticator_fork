@@ -11,9 +11,14 @@ use trussed::{
     },
 };
 use trussed_hkdf::{KeyOrData, OkmId};
+use core::{default, ops::Deref};
 
 // PIN protocol 1 supports 16 or 32 bytes, PIN protocol 2 requires 32 bytes.
 const PIN_TOKEN_LENGTH: usize = 32;
+const CTAP2_HMAC_KEY: &[u8; 14] = b"CTAP2 HMAC key";
+const CTAP2_AES_KEY: &[u8; 13] = b"CTAP2 AES key";
+const CTAP2_CLIENT_KEY: &[u8; 19] = b"CTAP2.1+ Client key";
+const CTAP2_TOKEN_KEY: &[u8; 18] = b"CTAP2.1+ Token key";
 
 #[derive(Clone, Copy, Debug)]
 pub enum PinProtocolVersion {
@@ -38,8 +43,18 @@ pub enum RpScope<'a> {
 }
 
 #[derive(Debug)]
+pub struct ExpandedPinToken {
+    // CTAP2.1+ expanded pin token to authenticate messages Client -> Token
+    client_key: KeyId,
+    // CTAP2.1+ expanded pin token to authenticate messages Token -> Client
+    token_key: KeyId,
+}
+
+#[derive(Debug)]
 pub struct PinToken {
     key_id: KeyId,
+    // CTAP2.1+ expansion
+    expanded_pin_token: Option<ExpandedPinToken>,
     state: PinTokenState,
 }
 
@@ -53,12 +68,18 @@ impl PinToken {
     fn new(key_id: KeyId) -> Self {
         Self {
             key_id,
+            expanded_pin_token: Default::default(),
             state: Default::default(),
         }
     }
 
-    fn delete<T: CryptoClient>(self, trussed: &mut T) {
+    fn delete<T: CryptoClient>(mut self, trussed: &mut T) {
         syscall!(trussed.delete(self.key_id));
+        if self.expanded_pin_token.is_some() {
+            syscall!(trussed.delete(self.expanded_pin_token.as_ref().unwrap().client_key));
+            syscall!(trussed.delete(self.expanded_pin_token.as_ref().unwrap().token_key));
+            self.expanded_pin_token = None;
+        }
     }
 
     pub fn require_permissions(&self, permissions: Permissions) -> Result<()> {
@@ -249,6 +270,8 @@ impl<'a, T: TrussedRequirements> PinProtocol<'a, T> {
     // in spec: getPublicKey
     #[must_use]
     pub fn key_agreement_key(&mut self) -> EcdhEsHkdf256PublicKey {
+        // CTAP2.1++
+        self.regenerate();
         let public_key = syscall!(self
             .trussed
             .derive_p256_public_key(self.state.key_agreement_key, Location::Volatile))
@@ -275,9 +298,15 @@ impl<'a, T: TrussedRequirements> PinProtocol<'a, T> {
     }
 
     // in spec: verify(pinUvAuthToken, ...)
-    pub fn verify_pin_token(&mut self, data: &[u8], signature: &[u8]) -> Result<&PinToken> {
+    // CTAP2.1+ -> verifies pin auth using either the pintoken in CTAP2 or the expanded pin token from CTAP2.1+
+    // TODO: Restructure function to avoid two "if mutual"
+    pub fn verify_pin_token(&mut self, data: &[u8], signature: &[u8], mutual: bool) -> Result<&PinToken> {
+        if mutual {   
+            self.expand_pin_token()?;
+        };
         let pin_token = self.pin_token().ok_or(Error::PinAuthInvalid)?;
-        if pin_token.state.is_in_use && self.verify(pin_token.key_id, data, signature) {
+        let key_id = if mutual { pin_token.expanded_pin_token.as_ref().unwrap().client_key } else { pin_token.key_id };
+        if pin_token.state.is_in_use && self.verify(key_id, data, signature) {
             // We previously checked that `pin_token()` is not None in the first line of this
             // function so this cannot panic, but we cannot return the `pin_token` variable here
             // because of the `verify` call after it.
@@ -380,8 +409,8 @@ impl<'a, T: TrussedRequirements> PinProtocol<'a, T> {
         ))
         .ok()?
         .okm;
-        let hmac_key_id = hkdf(self.trussed, okm, b"CTAP2 HMAC key");
-        let aes_key_id = hkdf(self.trussed, okm, b"CTAP2 AES key");
+        let hmac_key_id = hkdf(self.trussed, okm, CTAP2_HMAC_KEY);
+        let aes_key_id = hkdf(self.trussed, okm, CTAP2_AES_KEY);
 
         syscall!(self.trussed.delete(okm.0));
 
@@ -389,6 +418,72 @@ impl<'a, T: TrussedRequirements> PinProtocol<'a, T> {
             hmac_key_id: hmac_key_id?,
             aes_key_id: aes_key_id?,
         })
+    }
+
+    // CTAP2.1+: derive two keys from pintoken using HKDF-SHA-256
+    fn kdf_mpaca(&mut self, input: KeyId) -> Option<ExpandedPinToken> {
+        fn hkdf<T: TrussedRequirements>(trussed: &mut T, okm: OkmId, info: &[u8]) -> Option<KeyId> {
+            let info = Message::from_slice(info).ok()?;
+            try_syscall!(trussed.hkdf_expand(okm, info, 32, Location::Volatile))
+                .ok()
+                .map(|reply| reply.key)
+        }
+
+        // salt: 0x00 * 32 => None
+        let okm = try_syscall!(self.trussed.hkdf_extract(
+            KeyOrData::Key(input),
+            None,
+            Location::Volatile
+        ))
+        .ok()?
+        .okm;
+        let client_key = hkdf(self.trussed, okm, CTAP2_CLIENT_KEY);
+        let token_key = hkdf(self.trussed, okm, CTAP2_TOKEN_KEY);
+
+        syscall!(self.trussed.delete(okm.0));
+
+        Some(ExpandedPinToken {
+            client_key: client_key?,
+            token_key: token_key?,
+        })
+    }
+    
+    // CTAP2.1+ function to expand the pin_token for mutual authentication
+    fn expand_pin_token(&mut self) -> Result<()> {
+        if (self.is_pin_token_expanded()) {
+            return Ok(())
+        }
+        let pin_token = {
+            let pin_token = self.pin_token().unwrap();
+            pin_token
+        };
+        //CTAP2.1+ TODO: deal with potential errors here with unwrap
+        let expanded_pin_token = self.kdf_mpaca(pin_token.key_id).unwrap();
+        let pin_token = self.state.pin_token_v2.as_mut().unwrap();
+        pin_token.expanded_pin_token = Some(expanded_pin_token);
+        Ok(())
+    }
+
+    pub fn authenticate_response(&mut self, data: &[u8]) -> Result<[u8;32]>{
+        if !self.is_pin_token_expanded() {
+            return Err(Error::CannotAuthenticateResponse);
+        }
+        let pin_token = self.pin_token().ok_or(Error::PinAuthInvalid)?;
+        if pin_token.state.is_in_use {
+            let mut signature = [0u8;32];
+            let key = pin_token.expanded_pin_token.as_ref().ok_or(Error::CannotAuthenticateResponse)?;
+            signature.copy_from_slice(&syscall!(self.trussed.sign_hmacsha256(key.token_key, data)).signature[..]);
+            Ok(signature)
+        } else {
+            Err(Error::PinAuthInvalid)
+        }
+    }
+
+    fn is_pin_token_expanded(&self) -> bool {
+        if let Some(x) = self.pin_token() {
+            return x.expanded_pin_token.is_some()
+        }
+        false
     }
 }
 

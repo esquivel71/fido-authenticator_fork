@@ -1,5 +1,6 @@
 //! The `ctap_types::ctap2::Authenticator` implementation.
 
+use cbor_smol::ser::Serializer;
 use credential_management::CredentialManagement;
 use ctap_types::{
     ctap2::{
@@ -14,6 +15,7 @@ use ctap_types::{
     ByteArray, Error,
 };
 use littlefs2_core::path;
+use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
 use trussed::{
@@ -53,6 +55,8 @@ impl<UP: UserPresence, T: TrussedRequirements> Authenticator for crate::Authenti
         versions.push(Version::U2fV2).unwrap();
         versions.push(Version::Fido2_0).unwrap();
         versions.push(Version::Fido2_1).unwrap();
+        // CTAP2.1+ -> inform that token supports CTAP2.1+ mutual authentication
+        versions.push(Version::Fido2_1P).unwrap();
 
         let mut extensions = Vec::new();
         extensions.push(Extension::CredProtect).unwrap();
@@ -560,6 +564,31 @@ impl<UP: UserPresence, T: TrussedRequirements> Authenticator for crate::Authenti
         .build();
         attestation_object.att_stmt = att_stmt;
         attestation_object.large_blob_key = large_blob_key;
+
+
+        // CTAP2.1+ step of authenticating the response back
+        if let Some(ref options) = &parameters.options {
+            if Some(true) == options.ma && uv_performed {
+                // MAX size of auth_data + (optional) att_stmt signature + (optional) large blob key
+                let mut to_auth = [0u8; sizes::AUTHENTICATOR_DATA_LENGTH + sizes::ASN1_SIGNATURE_LENGTH + 32];
+                let pin_protocol_version = self.parse_pin_protocol(parameters.pin_protocol.unwrap())?;
+                let mut pin_protocol = self.pin_protocol(pin_protocol_version);
+                let mut size = attestation_object.auth_data.len();
+                // Authenticator data
+                to_auth[..size].copy_from_slice(&attestation_object.auth_data);
+                // Attestation signature, if any
+                if let Some(AttestationStatement::Packed(packed)) = &attestation_object.att_stmt {
+                    to_auth[size..size + &packed.sig.len()].copy_from_slice(&packed.sig);
+                    size += &packed.sig.len();
+                }
+                // Large blob, if any
+                if let Some(large_blob_key) = attestation_object.large_blob_key {
+                    to_auth[size..size+32].copy_from_slice(&large_blob_key.as_slice());
+                    size += 32;
+                }
+                attestation_object.response_auth = Some(pin_protocol.authenticate_response(&to_auth[..size])?);
+            }
+        }
         Ok(attestation_object)
     }
 
@@ -1075,7 +1104,32 @@ impl<UP: UserPresence, T: TrussedRequirements> Authenticator for crate::Authenti
             n => Some(n),
         };
 
-        self.assert_with_credential(num_credentials, credential)
+        let mut assertion_object = self.assert_with_credential(num_credentials, credential)?;
+
+        // CTAP2.1+ step of authenticating the response back
+        if let Some(ref options) = &parameters.options {
+            if Some(true) == options.ma && uv_performed {
+                // MAX size of auth_data + (optional) att_stmt signature + (optional) large blob key
+                let mut to_auth = [0u8; sizes::AUTHENTICATOR_DATA_LENGTH + sizes::ASN1_SIGNATURE_LENGTH + sizes::ASN1_SIGNATURE_LENGTH];
+                let mut size = assertion_object.auth_data.len();
+                let pin_protocol_version = self.parse_pin_protocol(parameters.pin_protocol.unwrap())?;
+                let mut pin_protocol = self.pin_protocol(pin_protocol_version);
+                // Authenticator Data
+                to_auth[..size].copy_from_slice(&assertion_object.auth_data);
+                // Assertion signature
+                let sig = assertion_object.signature.as_slice();
+                to_auth[size..size + sig.len()].copy_from_slice(sig);
+                size += sig.len();
+                if let Some(AttestationStatement::Packed(packed)) = &assertion_object.att_stmt {
+                    to_auth[size..size + &packed.sig.len()].copy_from_slice(&packed.sig);
+                    size += &packed.sig.len();
+                }
+                assertion_object.response_auth = Some(pin_protocol.authenticate_response(&to_auth[..size])?);
+            }
+        }
+
+        Ok(assertion_object)
+
     }
 
     #[inline(never)]
@@ -1360,7 +1414,7 @@ impl<UP: UserPresence, T: TrussedRequirements> crate::Authenticator<UP, T> {
                     .ok_or(Error::MissingParameter)?;
 
                 let mut pin_protocol = self.pin_protocol(pin_protocol);
-                if let Ok(pin_token) = pin_protocol.verify_pin_token(&data[..len], pin_auth) {
+                if let Ok(pin_token) = pin_protocol.verify_pin_token(&data[..len], pin_auth, false) {
                     info_now!("passed pinauth");
                     pin_token.require_permissions(Permissions::CREDENTIAL_MANAGEMENT)?;
                     pin_token.require_valid_for_rp(rp_scope)?;
@@ -1451,7 +1505,15 @@ impl<UP: UserPresence, T: TrussedRequirements> crate::Authenticator<UP, T> {
                     // success --> set uv = 1
                     // error --> PinAuthInvalid
                     let mut pin_protocol = self.pin_protocol(pin_protocol);
-                    let pin_token = pin_protocol.verify_pin_token(data, pin_auth)?;
+                    // CTAP2.1+ only ***
+                    let mut mutual = false;
+                    if let Some(ref options) = &options {
+                        if Some(true) == options.ma {
+                            mutual = true;
+                        }
+                    }
+                    // ***
+                    let pin_token = pin_protocol.verify_pin_token(data, pin_auth, mutual)?;
                     pin_token.require_permissions(permissions)?;
                     pin_token.require_valid_for_rp(RpScope::RpId(rp_id))?;
 
@@ -1999,7 +2061,7 @@ impl<UP: UserPresence, T: TrussedRequirements> crate::Authenticator<UP, T> {
             auth_data.extend_from_slice(&Sha256::digest(data)).unwrap();
 
             let mut pin_protocol = self.pin_protocol(pin_protocol);
-            let pin_token = pin_protocol.verify_pin_token(&pin_auth, &auth_data)?;
+            let pin_token = pin_protocol.verify_pin_token(&pin_auth, &auth_data, false)?;
             pin_token.require_permissions(Permissions::LARGE_BLOB_WRITE)?;
         }
 
