@@ -271,7 +271,7 @@ impl<'a, T: TrussedRequirements> PinProtocol<'a, T> {
     #[must_use]
     pub fn key_agreement_key(&mut self) -> EcdhEsHkdf256PublicKey {
         // CTAP2.1++
-        self.regenerate();
+        // self.regenerate();
         let public_key = syscall!(self
             .trussed
             .derive_p256_public_key(self.state.key_agreement_key, Location::Volatile))
