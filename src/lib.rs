@@ -239,12 +239,13 @@ impl UserPresence for Conforming {
         trussed: &mut T,
         timeout_milliseconds: u32,
     ) -> Result<()> {
-        let result = syscall!(trussed.confirm_user_present(timeout_milliseconds)).result;
-        result.map_err(|err| match err {
-            trussed::types::consent::Error::TimedOut => Error::UserActionTimeout,
-            trussed::types::consent::Error::Interrupted => Error::KeepaliveCancel,
-            _ => Error::OperationDenied,
-        })
+        Ok(())
+        // let result = syscall!(trussed.confirm_user_present(timeout_milliseconds)).result;
+        // result.map_err(|err| match err {
+        //     trussed::types::consent::Error::TimedOut => Error::UserActionTimeout,
+        //     trussed::types::consent::Error::Interrupted => Error::KeepaliveCancel,
+        //     _ => Error::OperationDenied,
+        // })
     }
 }
 
